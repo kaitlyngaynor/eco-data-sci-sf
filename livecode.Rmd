@@ -1,0 +1,183 @@
+---
+title: "livecode"
+author: "Kaitlyn"
+date: "3/10/2020"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(mapview)
+library(dplyr)
+library(measurements)
+library(readr)
+```
+
+
+```{r}
+fire_perims <- read_sf("data/fire_perims/mtbs_perims_DD.shp")
+head(fire_perims)
+mapview(fire_perims)
+```
+
+If you just want to pull the attributes from the data frame, you can drop the geometry. Then you can make a csv, etc.
+```{r}
+fire_df <- data.frame(fire_perims) %>% 
+  select(-geometry)
+```
+
+Extract attributes from the data
+```{r}
+# can see that you have four kinds of fire
+distinct(fire_df, Fire_Type)
+
+# if you want to only take a given type of fire, can filter the sf object using dplyr
+fire_perims <- filter(fire_perims, Fire_Type != "RX")
+```
+
+## Choosing a coordinate reference system
+```{r choose crs}
+# check the current 
+st_crs(fire_perims) 
+
+st_is_longlat(fire_perims) # checks to see if it is longlat - yes it is, you can't do distance calculations with them
+
+# project it so that it 
+fire_proj <- st_transform(fire_perims, crs=3310) # transform into California Albers projection
+
+# check the CRS
+st_crs(fire_proj)
+```
+
+## Measure area of polygons
+```{r measure area}
+# function st_area will calculate the area of the polygon
+fire_proj <- mutate(fire_proj, area = st_area(fire_proj))
+
+head(fire_proj)
+
+# we already had a column for acres; convert the newly-calculated area in meters-squared back into acres
+fire_proj <- mutate(fire_proj, area = measurements::conv_unit(area, from = "m2", to = "acre"))
+head(fire_proj) # annoyingly, we still have a note that it is in m^2; it's a named number type, and we want it as a numeric
+
+fire_proj <- mutate(fire_proj, area = as.numeric(area))
+```
+
+Sometimes we have spatial information in a non-spatial data format. We will import some data on federally managed campgrounds from [Recreation.gov](https://recreation.gov).
+
+```{r campground data import}
+campgrounds <- read_csv("data/recreation/campgrounds.csv")
+head(campgrounds)
+```
+
+```{r convert csv to spatial}
+campground_sf <- st_as_sf(campgrounds, 
+                          coords = c("facility_longitude", "facility_latitude"), 
+                          crs = 4269, # NAD83
+                          remove = F) # won't remove the latitude and longitude columns
+mapview(campground_sf)
+
+# let's just subset it to national parks in california
+ca_nps <- campground_sf %>% 
+  filter(state_code == "CA" & agency_name == "NPS")
+
+mapview(ca_nps)
+
+write_sf(ca_nps, "output/ca_nps.shp")
+```
+
+## Drawing buffers
+```{r draw buffers}
+# project
+ca_nps_proj <- st_transform(ca_nps, crs = 3310)
+
+ca_nps_buffer <- st_buffer(ca_nps_proj, 30000)
+
+mapview(ca_nps_buffer)
+```
+
+## Intersections
+
+How many national park campgrounds were within 30 km of a wildfire in 2010-2016?
+Can see if your 30 km buffers overlap with the wildfire data.
+
+```{r}
+mapview(ca_nps_buffer) + 
+  mapview(fire_proj, col.regions = "orange")
+```
+
+Let's see what intersects. This creates a list object that has the index of all of the ca_nps_buffers that match up with the index of fires - not really ideal for working with.
+```{r}
+fire_intersects <- 
+  st_intersects(ca_nps_buffer, fire_proj)
+
+# convert to a matrix so it's easier to work with
+fire_intersects_matrix <- as.matrix(fire_intersects)
+
+# or a key-value format
+fire_intersects_keyvalue <- data.frame(fire_intersects)
+head(fire_intersects_keyvalue)
+```
+
+
+## Measuring distance
+
+We can measure the distance of our spatial objects from each other. For each of our 61 campgrounds, how far were they from each of the 247 fires? We will return a matrix of dimensions 61 by 247 using `sf::st_distance`. Since our projected data are in meters, the answer will be in meters.
+
+```{r distance}
+fire_dist <- st_distance(ca_nps_proj, fire_proj) %>% data.frame()
+head(fire_dist)
+
+# coerce to numeric format
+fire_dist[] <- lapply(fire_dist, as.numeric)
+head(fire_dist)
+```
+
+## Testing if objects contain one another
+
+```{r read in smoke data}
+# read in NOAA smoke data
+smoke <- read_sf("data/smoke/hms_smoke20150819.shp", 
+                 crs = 4269) # NAD83
+
+# restrict fires to only those that were burning in sumemr 2015, so they match up with smoke data
+fire_2015 <- fire_perims %>% 
+  filter(Year == 2015 & StartMonth %in% 6:8)
+
+# mapview
+mapview(ca_nps) + 
+  mapview(smoke, col.regions = "lightgrey") +
+  mapview(fire_2015, col.regions = "orange")
+```
+
+```{r testing within}
+smoke_proj <- st_transform(smoke, crs = 3310)
+
+# test if campgrounds are within smoke
+campgrounds_within <- st_within(ca_nps_proj, smoke_proj)
+```
+
+## Bonus - creating a static map
+
+```{r}
+ca <- read_sf("data/state/california2016.shp")
+
+ggplot() +
+  geom_sf(data=ca) +
+  geom_sf(data=ca_nps, color = "darkgreen") +
+  geom_sf(data=fire_perims, color = "orange", fill = "orange", alpha = 0.5)
+
+# if you want a projected version of california...
+
+ca_proj <- st_transform(ca, crs = 3310)
+
+ggplot() +
+  geom_sf(data=ca_proj) +
+  geom_sf(data=ca_nps, color = "darkgreen") +
+  geom_sf(data=fire_perims, color = "orange", fill = "orange", alpha = 0.5) +
+  theme_bw()
+```
+
